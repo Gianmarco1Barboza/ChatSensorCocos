@@ -1,119 +1,101 @@
-import numpy as np
+import os
+import json
 import time
+import random
+import numpy as np
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
-from keybrd import is_pressed, rising_edge
 
 # =========================================================
-# --- CONFIGURACIÓN AJUSTABLE POR TI ---
+# ----------- CONFIG GENERAL DEL ROBOT / ESCENA -----------
 # =========================================================
 
-# Geometría / límites
-WHEEL_D = 0.05      # diámetro de la llanta [m]
-MAX_SPEED = 1.2     # [m/s] velocidad lineal máxima que quieres permitir
+WHEEL_D = 0.05       # diámetro llanta [m]
+MAX_SPEED = 1.2      # velocidad lineal máx [m/s]
+BASE_SPEED = 0.4     # velocidad base hacia adelante (0 a 1 aprox)
+MAX_CORRECTION = 0.6 # cuánto puedo girar máx (0 a 1)
+STEERING_SIGN = 1.0  # <-- SI SE PONE A GIRAR EN DONAS, CAMBIA A -1.0
 
-# Velocidad base del robot (normalizada -1 a 1)
-BASE_SPEED = 0.5    # súbelo si quieres más rápido en recta
+LOST_LINE_THRESHOLD = 0  # si no ve negro en ningún sensor: asumimos línea perdida
+CONTROL_DT = 0.01        # segundos entre steps de control
+EPISODE_TIME = 3.0       # duración de cada episodio en segundos reales
+LOG_DIR = "logs"         # carpeta donde guardamos las pruebas
 
-# Ganancias PID (empieza con esto y luego ajusta)
-Kp = 0.8            # cuánto corrige por el error actual
-Ki = 0.0            # cuánto corrige por error acumulado (empieza en 0)
-Kd = 0.15           # cuánto corrige por el cambio rápido del error
-
-# Cuánta corrección máxima se permite meter al giro
-MAX_CORRECTION = 0.6  # límite a la salida del PID para que no sature loco
-
-# Umbral para detectar "no veo la línea"
-LOST_LINE_THRESHOLD = 0  # si la suma de sensores activos es <= esto => línea perdida
+# Crea carpeta de logs si no existe
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # =========================================================
-# ---- FUNCIONES QUE YA TENÍAS (ligeramente comentadas) ---
+# --------- CONEXIÓN A COPPELIASIM / HANDLES --------------
+# =========================================================
+client = RemoteAPIClient('localhost', 23000)
+sim = client.getObject('sim')
+
+left_mtr = sim.getObject('/LineTracer/DynamicLeftJoint')
+right_mtr = sim.getObject('/LineTracer/DynamicRightJoint')
+cam_handles = [sim.getObject(f"/LineTracer/lineSensor[{i}]") for i in range(8)]
+
+
+# =========================================================
+# -------------------- FUNCIONES BASE ---------------------
 # =========================================================
 
 def get_sensor_values(threshold=0.2):
     """
     Lee los 8 sensores de visión y regresa una lista de 0/1
-    1 = línea detectada (oscuro), 0 = piso claro
-
-    Ejemplo: [0,0,1,1,1,0,0,0]
+    1 = línea negra detectada, 0 = piso claro
     """
     states = []
     for h in cam_handles:
         img, res = sim.getVisionSensorImg(h)
         w, hres = int(res[0]), int(res[1])
 
-        # Convertir el buffer a arreglo numpy
         buf = np.frombuffer(img, dtype=np.uint8)
-
-        # Reconstruir imagen RGB
         frame = buf.reshape(hres, w, 3).astype(np.float32) / 255.0
         gray = frame.mean(axis=2)
 
-        # Detección binaria del negro
         detected = 1 if gray.mean() < threshold else 0
         states.append(detected)
-
-    return states  # lista de 8 enteros 0/1
+    return states
 
 
 def set_motor_speeds(norm_left, norm_right):
     """
-    Ajusta velocidades de las ruedas con valores normalizados [-1, 1].
-    -1 = full backwards, 0 = stop, 1 = full forward.
+    norm_left, norm_right en [-1, 1].
+    Se convierten a velocidad angular de cada junta.
     """
-
-    # Saturar a [-1, 1]
+    # saturamos
     norm_left = max(-1.0, min(1.0, norm_left))
     norm_right = max(-1.0, min(1.0, norm_right))
 
-    # Normalizado -> velocidad lineal (m/s)
+    # normalizado -> lineal
     left_linear_velocity = norm_left * MAX_SPEED
     right_linear_velocity = norm_right * MAX_SPEED
 
-    # lineal -> angular [rad/s]  ω = v / (r)  con r = D/2
-    left_angular_velocity = left_linear_velocity / (WHEEL_D / 2)
-    right_angular_velocity = right_linear_velocity / (WHEEL_D / 2)
+    # lineal -> angular
+    left_ang_vel = left_linear_velocity / (WHEEL_D / 2)
+    right_ang_vel = right_linear_velocity / (WHEEL_D / 2)
 
-    # Mandar a CoppeliaSim
     client.setStepping(True)
-    sim.setJointTargetVelocity(left_mtr, left_angular_velocity)
-    sim.setJointTargetVelocity(right_mtr, right_angular_velocity)
+    sim.setJointTargetVelocity(left_mtr, left_ang_vel)
+    sim.setJointTargetVelocity(right_mtr, right_ang_vel)
     client.setStepping(False)
 
 
-# =========================================================
-# --- NUEVAS FUNCIONES PID / CONTROL DE LÍNEA -------------
-# =========================================================
-
 def compute_line_error(sensors, last_error):
     """
-    Convierte el patrón de sensores en un 'error' continuo.
-    Idea:
-        Asignamos pesos (posición) a cada sensor de izq -> der.
-        Mientras más a la izquierda vea negro, más negativo es el error.
-        Mientras más a la derecha vea negro, más positivo es el error.
-    
-    Ejemplo pesos para 8 sensores:
-        [ -3, -2, -1, -0.5, 0.5, 1, 2, 3 ]
-
-    Si los sensores activos están más del lado izquierdo => error negativo
-    Si están más del lado derecho => error positivo
-
-    Si no detecta ninguno, devolvemos el último error (seguir girando
-    hacia donde íbamos).
+    Convierte sensores [s0..s7] a un error continuo.
+    Pesos más negativos = más a la izquierda.
+    Pesos más positivos = más a la derecha.
     """
-
     weights = np.array([-3, -2, -1, -0.5, 0.5, 1, 2, 3], dtype=float)
-    sensors_arr = np.array(sensors, dtype=float)
+    s = np.array(sensors, dtype=float)
 
-    active_sum = sensors_arr.sum()
+    active_sum = s.sum()
 
     if active_sum <= LOST_LINE_THRESHOLD:
-        # Línea perdida: regresamos last_error para intentar recuperar
+        # No vemos la línea -> mantenemos la misma dirección que traíamos
         return last_error
 
-    # Centroide ponderado
-    weighted_pos = (weights * sensors_arr).sum() / active_sum
-    # Ese weighted_pos lo usamos directamente como error
+    weighted_pos = (weights * s).sum() / active_sum
     return weighted_pos
 
 
@@ -132,57 +114,42 @@ class PIDController:
         self.prev_time = None
 
     def update(self, error):
-        """
-        Calcula la salida PID dada el error actual.
-        Maneja dt automáticamente con timestamps.
-        """
         now = time.time()
-
-        # Primer ciclo: no tenemos dt previo
         if self.prev_time is None:
             dt = 0.0
         else:
             dt = now - self.prev_time
-            if dt <= 0.0:
-                dt = 1e-6  # evita división por cero
+            if dt <= 0:
+                dt = 1e-6
 
-        # ---- Termino P ----
+        # PID
         P = self.Kp * error
-
-        # ---- Termino I ----
         self.integral += error * dt
         I = self.Ki * self.integral
+        d_error = (error - self.prev_error) / dt if dt > 0 else 0.0
+        D = self.Kd * d_error
 
-        # ---- Termino D ----
-        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
-        D = self.Kd * derivative
-
-        # Guardar estado para siguiente iteración
+        # guardar estado
         self.prev_error = error
         self.prev_time = now
 
-        # Salida total
         return P + I + D
 
 
 def apply_pid_to_motors(pid_output):
     """
-    Toma la salida del PID (corrección de giro) y la traduce a velocidades
-    de las llantas.
-    - Si pid_output > 0 => gira a la derecha (rueda izquierda más rápida)
-    - Si pid_output < 0 => gira a la izquierda
-
-    BASE_SPEED es avance recto.
+    Toma la salida del PID y calcula las velocidades de las ruedas.
+    STEERING_SIGN controla la dirección del giro.
     """
+    correction = STEERING_SIGN * pid_output
 
-    # Limitar la corrección para que no sea exagerada
-    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, pid_output))
+    # Limitar qué tan agresivo puede girar
+    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
 
-    # Mezcla diferencial
     left_cmd = BASE_SPEED - correction
     right_cmd = BASE_SPEED + correction
 
-    # Normalizar a rango [-1, 1] por seguridad
+    # saturar seguridad [-1, 1]
     left_cmd = max(-1.0, min(1.0, left_cmd))
     right_cmd = max(-1.0, min(1.0, right_cmd))
 
@@ -190,54 +157,163 @@ def apply_pid_to_motors(pid_output):
 
 
 # =========================================================
-# --- INICIALIZACIÓN DE CoppeliaSim (igual que tu código) -
+# -------- EPISODIO DE SIMULACIÓN / FUNCIÓN REWARD --------
 # =========================================================
 
-client = RemoteAPIClient('localhost', 23000)
-sim = client.getObject('sim')
+def run_episode(params, episode_idx):
+    """
+    Corre la simulación con parámetros PID dados.
+    Devuelve una recompensa 'reward' y estadísticas.
 
-left_mtr = sim.getObject('/LineTracer/DynamicLeftJoint')
-right_mtr = sim.getObject('/LineTracer/DynamicRightJoint')
-cam_handles = [sim.getObject(f"/LineTracer/lineSensor[{i}]") for i in range(8)]
+    params = {
+        "Kp": float,
+        "Ki": float,
+        "Kd": float
+    }
 
+    Recompensa básica:
+    - Queremos que el robot se mantenga centrado (error pequeño)
+    - Queremos que avance (ruedas no paradas)
+    """
 
-# =========================================================
-# --- LOOP PRINCIPAL DE CONTROL ---------------------------
-# =========================================================
-if __name__ == "__main__":
-    pid = PIDController(Kp, Ki, Kd)
+    # Creamos controlador PID con estos params
+    pid = PIDController(params["Kp"], params["Ki"], params["Kd"])
+
+    # Reinicia escena:
+    # En CoppeliaSim, stopSimulation -> startSimulation normalmente
+    # regresa al estado inicial de la escena.
+    sim.stopSimulation()
+    # mini delay para que CoppeliaSim procese el stop
+    time.sleep(0.2)
+    sim.startSimulation()
+
+    start_time = time.time()
     last_error = 0.0
 
-    try:
-        sim.startSimulation()
+    abs_error_sum = 0.0
+    step_count = 0
+    straightness_sum = 0.0  # proxy de avance estable
 
-        # Loop mientras la simulación esté corriendo
-        while sim.getSimulationState() != sim.simulation_stopped:
+    while sim.getSimulationState() != sim.simulation_stopped:
+        now = time.time()
+        if (now - start_time) >= EPISODE_TIME:
+            # terminamos este episodio
+            break
 
-            # 1. Leer sensores binarios
-            sensors = get_sensor_values()
-            #   Ejemplo: [0,0,1,1,1,0,0,0]
-            #   print para debug:
-            print("sens:", sensors)
+        sensors = get_sensor_values()
+        err = compute_line_error(sensors, last_error)
+        last_error = err
 
-            # 2. Calcular error de posición de la línea
-            error = compute_line_error(sensors, last_error)
-            last_error = error
-            #   print para debug:
-            print("err:", round(error, 3))
+        pid_out = pid.update(err)
+        apply_pid_to_motors(pid_out)
 
-            # 3. Actualizar PID con ese error
-            pid_output = pid.update(error)
-            #   print para debug:
-            print("pid:", round(pid_output, 3))
+        # Métrica de qué tan desviado estás
+        abs_error_sum += abs(err)
 
-            # 4. Traducir el PID a comandos de rueda
-            apply_pid_to_motors(pid_output)
+        # Métrica de "avance recto": si las dos ruedas están parecidas al BASE_SPEED
+        # interpretamos que el robot está avanzando y no girando loco.
+        # Nota: esto es aproximado, porque no leemos la velocidad real del joint,
+        # pero sirve como heurística.
+        straightness = 1.0 - min(1.0, abs(pid_out))  # grande si pid_out ~ 0
+        straightness_sum += straightness
 
-            # Pequeña pausa para no saturar (ajusta si quieres más frecuencia)
-            time.sleep(0.01)
+        step_count += 1
+        time.sleep(CONTROL_DT)
 
-    finally:
-        sim.stopSimulation()
-        # Frenar motores por seguridad
-        set_motor_speeds(0.0, 0.0)
+    # Frenar robot
+    set_motor_speeds(0.0, 0.0)
+    sim.stopSimulation()
+    time.sleep(0.1)
+
+    if step_count == 0:
+        avg_err = 999.0
+        avg_straight = 0.0
+    else:
+        avg_err = abs_error_sum / step_count
+        avg_straight = straightness_sum / step_count
+
+    # Definimos recompensa:
+    # - Penalizar error promedio
+    # - Premiar ir "recto"
+    # Puedes tunear estos pesos.
+    reward = (2.0 * avg_straight) - (1.0 * avg_err)
+
+    # Guardar log del episodio
+    data = {
+        "episode": episode_idx,
+        "params": params,
+        "avg_error": avg_err,
+        "avg_straight": avg_straight,
+        "reward": reward,
+        "timestamp": time.time()
+    }
+
+    log_path = os.path.join(LOG_DIR, f"prueba_{episode_idx}.json")
+    with open(log_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"[EP {episode_idx}] reward={reward:.3f}  err={avg_err:.3f}  straight={avg_straight:.3f}")
+    print(f"guardado en {log_path}")
+
+    return reward, data
+
+
+# =========================================================
+# ---------- LOOP DE "APRENDIZAJE" / BUSCADOR PID ---------
+# =========================================================
+
+def mutate_params(best_params, scale=0.2):
+    """
+    Hace una 'mutación' aleatoria de los mejores params.
+    scale controla qué tan agresivo muta.
+    Nos aseguramos que no sean negativos raros.
+    """
+    def mutate(val):
+        return max(0.0, val + random.gauss(0, scale * abs(val + 1e-6)))
+
+    new_params = {
+        "Kp": mutate(best_params["Kp"]),
+        "Ki": mutate(best_params["Ki"]),
+        "Kd": mutate(best_params["Kd"]),
+    }
+    return new_params
+
+
+def save_best(best_data):
+    best_path = os.path.join(LOG_DIR, "best_params.json")
+    with open(best_path, "w") as f:
+        json.dump(best_data, f, indent=2)
+    print(f"[MEJOR ACTUALIZADO] {best_path}")
+
+
+if __name__ == "__main__":
+    # PID inicial (tú puedes cambiar esto)
+    best_params = {
+        "Kp": 0.8,
+        "Ki": 0.0,
+        "Kd": 0.15
+    }
+
+    # Evaluar episodio 0 con params iniciales
+    best_reward, best_data = run_episode(best_params, episode_idx=0)
+    save_best(best_data)
+
+    # Número total de episodios que quieres probar en este run
+    # (puedes subirlo cuando ya esté estable)
+    NUM_EPISODES = 10
+
+    for ep in range(1, NUM_EPISODES + 1):
+        # Proponemos nuevos PID basados en el mejor hasta ahora
+        candidate_params = mutate_params(best_params, scale=0.3)
+
+        reward, data = run_episode(candidate_params, episode_idx=ep)
+
+        # Si mejora, lo adoptamos como el nuevo best
+        if reward > best_reward:
+            best_reward = reward
+            best_params = candidate_params
+            best_data = data
+            save_best(best_data)
+
+    # Al final del script, motores en 0 por seguridad
+    set_motor_speeds(0.0, 0.0)
