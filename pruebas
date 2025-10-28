@@ -1,0 +1,52 @@
+import time
+import numpy as np
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
+WHEEL_D = 0.05
+MAX_SPEED = 1.2
+
+def get_sensor_values(threshold=0.2):
+    states = []
+    for h in cam_handles:
+        img, res = sim.getVisionSensorImg(h)
+        w, hres = int(res[0]), int(res[1])
+
+        buf = np.frombuffer(img, dtype=np.uint8)
+        frame = buf.reshape(hres, w, 3).astype(np.float32) / 255.0
+        gray = frame.mean(axis=2)
+
+        detected = 1 if gray.mean() < threshold else 0
+        states.append(detected)
+    return states
+
+def stop_motors():
+    # ponemos velocidades 0 para asegurar que no se mueva
+    client.setStepping(True)
+    sim.setJointTargetVelocity(left_mtr, 0.0)
+    sim.setJointTargetVelocity(right_mtr, 0.0)
+    client.setStepping(False)
+
+# --- conectar con CoppeliaSim ---
+client = RemoteAPIClient('localhost', 23000)
+sim = client.getObject('sim')
+
+left_mtr = sim.getObject('/LineTracer/DynamicLeftJoint')
+right_mtr = sim.getObject('/LineTracer/DynamicRightJoint')
+cam_handles = [sim.getObject(f"/LineTracer/lineSensor[{i}]") for i in range(8)]
+
+if __name__ == "__main__":
+    try:
+        sim.startSimulation()
+        print("DEBUG SENSORES: mueve el robot con el mouse en CoppeliaSim encima de la línea / a la izquierda / a la derecha.")
+        print("Sensor index 0 ....... 7")
+        while sim.getSimulationState() != sim.simulation_stopped:
+            vals = get_sensor_values()
+            # ejemplo: [0,0,1,1,1,0,0,0]
+            print("sensores:", vals)
+            stop_motors()  # asegurar que no se mueva
+            time.sleep(0.2)
+
+    finally:
+        sim.stopSimulation()
+        stop_motors()
+        print("Simulación detenida.")
