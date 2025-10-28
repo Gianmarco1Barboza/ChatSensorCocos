@@ -1,0 +1,243 @@
+import numpy as np
+import time
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from keybrd import is_pressed, rising_edge
+
+# =========================================================
+# --- CONFIGURACIÓN AJUSTABLE POR TI ---
+# =========================================================
+
+# Geometría / límites
+WHEEL_D = 0.05      # diámetro de la llanta [m]
+MAX_SPEED = 1.2     # [m/s] velocidad lineal máxima que quieres permitir
+
+# Velocidad base del robot (normalizada -1 a 1)
+BASE_SPEED = 0.5    # súbelo si quieres más rápido en recta
+
+# Ganancias PID (empieza con esto y luego ajusta)
+Kp = 0.8            # cuánto corrige por el error actual
+Ki = 0.0            # cuánto corrige por error acumulado (empieza en 0)
+Kd = 0.15           # cuánto corrige por el cambio rápido del error
+
+# Cuánta corrección máxima se permite meter al giro
+MAX_CORRECTION = 0.6  # límite a la salida del PID para que no sature loco
+
+# Umbral para detectar "no veo la línea"
+LOST_LINE_THRESHOLD = 0  # si la suma de sensores activos es <= esto => línea perdida
+
+# =========================================================
+# ---- FUNCIONES QUE YA TENÍAS (ligeramente comentadas) ---
+# =========================================================
+
+def get_sensor_values(threshold=0.2):
+    """
+    Lee los 8 sensores de visión y regresa una lista de 0/1
+    1 = línea detectada (oscuro), 0 = piso claro
+
+    Ejemplo: [0,0,1,1,1,0,0,0]
+    """
+    states = []
+    for h in cam_handles:
+        img, res = sim.getVisionSensorImg(h)
+        w, hres = int(res[0]), int(res[1])
+
+        # Convertir el buffer a arreglo numpy
+        buf = np.frombuffer(img, dtype=np.uint8)
+
+        # Reconstruir imagen RGB
+        frame = buf.reshape(hres, w, 3).astype(np.float32) / 255.0
+        gray = frame.mean(axis=2)
+
+        # Detección binaria del negro
+        detected = 1 if gray.mean() < threshold else 0
+        states.append(detected)
+
+    return states  # lista de 8 enteros 0/1
+
+
+def set_motor_speeds(norm_left, norm_right):
+    """
+    Ajusta velocidades de las ruedas con valores normalizados [-1, 1].
+    -1 = full backwards, 0 = stop, 1 = full forward.
+    """
+
+    # Saturar a [-1, 1]
+    norm_left = max(-1.0, min(1.0, norm_left))
+    norm_right = max(-1.0, min(1.0, norm_right))
+
+    # Normalizado -> velocidad lineal (m/s)
+    left_linear_velocity = norm_left * MAX_SPEED
+    right_linear_velocity = norm_right * MAX_SPEED
+
+    # lineal -> angular [rad/s]  ω = v / (r)  con r = D/2
+    left_angular_velocity = left_linear_velocity / (WHEEL_D / 2)
+    right_angular_velocity = right_linear_velocity / (WHEEL_D / 2)
+
+    # Mandar a CoppeliaSim
+    client.setStepping(True)
+    sim.setJointTargetVelocity(left_mtr, left_angular_velocity)
+    sim.setJointTargetVelocity(right_mtr, right_angular_velocity)
+    client.setStepping(False)
+
+
+# =========================================================
+# --- NUEVAS FUNCIONES PID / CONTROL DE LÍNEA -------------
+# =========================================================
+
+def compute_line_error(sensors, last_error):
+    """
+    Convierte el patrón de sensores en un 'error' continuo.
+    Idea:
+        Asignamos pesos (posición) a cada sensor de izq -> der.
+        Mientras más a la izquierda vea negro, más negativo es el error.
+        Mientras más a la derecha vea negro, más positivo es el error.
+    
+    Ejemplo pesos para 8 sensores:
+        [ -3, -2, -1, -0.5, 0.5, 1, 2, 3 ]
+
+    Si los sensores activos están más del lado izquierdo => error negativo
+    Si están más del lado derecho => error positivo
+
+    Si no detecta ninguno, devolvemos el último error (seguir girando
+    hacia donde íbamos).
+    """
+
+    weights = np.array([-3, -2, -1, -0.5, 0.5, 1, 2, 3], dtype=float)
+    sensors_arr = np.array(sensors, dtype=float)
+
+    active_sum = sensors_arr.sum()
+
+    if active_sum <= LOST_LINE_THRESHOLD:
+        # Línea perdida: regresamos last_error para intentar recuperar
+        return last_error
+
+    # Centroide ponderado
+    weighted_pos = (weights * sensors_arr).sum() / active_sum
+    # Ese weighted_pos lo usamos directamente como error
+    return weighted_pos
+
+
+class PIDController:
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+
+    def update(self, error):
+        """
+        Calcula la salida PID dada el error actual.
+        Maneja dt automáticamente con timestamps.
+        """
+        now = time.time()
+
+        # Primer ciclo: no tenemos dt previo
+        if self.prev_time is None:
+            dt = 0.0
+        else:
+            dt = now - self.prev_time
+            if dt <= 0.0:
+                dt = 1e-6  # evita división por cero
+
+        # ---- Termino P ----
+        P = self.Kp * error
+
+        # ---- Termino I ----
+        self.integral += error * dt
+        I = self.Ki * self.integral
+
+        # ---- Termino D ----
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        D = self.Kd * derivative
+
+        # Guardar estado para siguiente iteración
+        self.prev_error = error
+        self.prev_time = now
+
+        # Salida total
+        return P + I + D
+
+
+def apply_pid_to_motors(pid_output):
+    """
+    Toma la salida del PID (corrección de giro) y la traduce a velocidades
+    de las llantas.
+    - Si pid_output > 0 => gira a la derecha (rueda izquierda más rápida)
+    - Si pid_output < 0 => gira a la izquierda
+
+    BASE_SPEED es avance recto.
+    """
+
+    # Limitar la corrección para que no sea exagerada
+    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, pid_output))
+
+    # Mezcla diferencial
+    left_cmd = BASE_SPEED - correction
+    right_cmd = BASE_SPEED + correction
+
+    # Normalizar a rango [-1, 1] por seguridad
+    left_cmd = max(-1.0, min(1.0, left_cmd))
+    right_cmd = max(-1.0, min(1.0, right_cmd))
+
+    set_motor_speeds(left_cmd, right_cmd)
+
+
+# =========================================================
+# --- INICIALIZACIÓN DE CoppeliaSim (igual que tu código) -
+# =========================================================
+
+client = RemoteAPIClient('localhost', 23000)
+sim = client.getObject('sim')
+
+left_mtr = sim.getObject('/LineTracer/DynamicLeftJoint')
+right_mtr = sim.getObject('/LineTracer/DynamicRightJoint')
+cam_handles = [sim.getObject(f"/LineTracer/lineSensor[{i}]") for i in range(8)]
+
+
+# =========================================================
+# --- LOOP PRINCIPAL DE CONTROL ---------------------------
+# =========================================================
+if __name__ == "__main__":
+    pid = PIDController(Kp, Ki, Kd)
+    last_error = 0.0
+
+    try:
+        sim.startSimulation()
+
+        # Loop mientras la simulación esté corriendo
+        while sim.getSimulationState() != sim.simulation_stopped:
+
+            # 1. Leer sensores binarios
+            sensors = get_sensor_values()
+            #   Ejemplo: [0,0,1,1,1,0,0,0]
+            #   print para debug:
+            print("sens:", sensors)
+
+            # 2. Calcular error de posición de la línea
+            error = compute_line_error(sensors, last_error)
+            last_error = error
+            #   print para debug:
+            print("err:", round(error, 3))
+
+            # 3. Actualizar PID con ese error
+            pid_output = pid.update(error)
+            #   print para debug:
+            print("pid:", round(pid_output, 3))
+
+            # 4. Traducir el PID a comandos de rueda
+            apply_pid_to_motors(pid_output)
+
+            # Pequeña pausa para no saturar (ajusta si quieres más frecuencia)
+            time.sleep(0.01)
+
+    finally:
+        sim.stopSimulation()
+        # Frenar motores por seguridad
+        set_motor_speeds(0.0, 0.0)
