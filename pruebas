@@ -1,279 +1,303 @@
+import time
 import numpy as np
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
-import time
+from keybrd import is_pressed  # si no tienes keybrd comenta estas líneas
 
-# --- Functions you can use (don't change) --- #
+
+# =========================================================
+# =============== CONFIGURACIÓN IMPORTANTE =================
+# =========================================================
+
+# Geometría / límites físicos
+WHEEL_D = 0.05        # diámetro de la llanta [m]
+MAX_SPEED = 1.2       # velocidad lineal máxima [m/s] que dejaremos usar
+
+# Dirección física de cada motor:
+# si cuando das velocidades positivas iguales a las dos llantas el robot gira en círculo,
+# CAMBIA el signo de una de estas dos constantes.
+MOTOR_SIGN_LEFT  = 1.0
+MOTOR_SIGN_RIGHT = 1.0   # prueba con -1.0 si la rueda derecha está invertida
+
+# Velocidad base hacia adelante (normalizada -1..1 ANTES de convertir a m/s)
+BASE_SPEED = 0.4         # súbelo para más velocidad, bájalo para depurar
+
+# Límite máximo de giro diferencial que dejamos aplicar
+MAX_CORRECTION = 0.6     # si el robot gira muy agresivo, bájalo (ej. 0.3)
+
+# Ganancias del controlador PD
+Kp = 0.20                # qué tan fuerte responde al error actual
+Ki = 0.00                # integral (arranca en 0, casi siempre puede quedarse en 0)
+Kd = 0.40                # qué tanto amortigua el cambio rápido del error
+
+# Tasa de control (segundos entre iteraciones del loop)
+CONTROL_DT = 0.02        # 20ms aprox ~50Hz
+
+# MANEJO DE LA GEOMETRÍA DE TUS SENSORES
+#
+# 1) pesos = posición "horizontal" de cada sensor
+#    índice 0 = sensor más a la izquierda física
+#    índice 7 = sensor más a la derecha física
+#
+# la idea es que cuando la línea está bajo sensores izquierdos,
+# obtengas un valor negativo; si está bajo sensores derechos, positivo;
+# en el centro ~0.
+#
+# estos pesos DEBES ajustarlos a tu arreglo físico.
+# ej. [-3,-2,-1,-0.5,0.5,1,2,3] funciona bien si están en fila frontal
+#
+# si tus sensores están todos de un lado (por ejemplo lado IZQUIERDO del robot),
+# podrías haber medido que estando "bien colocado" la línea da algo como -5.
+# en ese caso tu error no quiere ir a 0, quiere ir a -5.
+# eso lo corregimos con TARGET_OFFSET.
+WEIGHTS = np.array([-3, -2, -1, -0.5, 0.5, 1, 2, 3], dtype=float)
+
+# este es el valor objetivo de la posición de la línea.
+# si tus sensores están CENTRADOS al frente del robot, deja 0.0
+# si tus sensores están LATERALIZADOS y mediste que "bien colocado" daba -5,
+# pon TARGET_OFFSET = -5.0
+TARGET_OFFSET = 0.0
+
+# si el robot corrige al lado contrario (se va más lejos de la línea en vez de acercarse),
+# cambia este signo a -1.0
+STEERING_SIGN = 1.0
+
+# cuando ningún sensor ve la línea (todos 0), usamos el último error para
+# tratar de recuperarla girando hacia donde la vimos por última vez
+LOST_LINE_THRESHOLD = 0  # si la suma de sensores <= esto => perdimos la línea
+
+
+# =========================================================
+# =============== FUNCIONES DE BAJO NIVEL =================
+# =========================================================
+
 def get_sensor_values(threshold=0.2):
     """
-    Read the 8 vision sensors and return a list of 0/1 values
-    (1 = line detected, 0 = no line)
+    Lee los 8 sensores de visión y regresa una lista de 8 enteros [0/1].
+    1 = detecta línea negra (oscuro), 0 = fondo claro.
     """
     states = []
     for h in cam_handles:
         img, res = sim.getVisionSensorImg(h)
         w, hres = int(res[0]), int(res[1])
+
+        # imagen cruda de CoppeliaSim en buffer plano
         buf = np.frombuffer(img, dtype=np.uint8)
+
+        # reconstruir imagen RGB
         frame = buf.reshape(hres, w, 3).astype(np.float32) / 255.0
         gray = frame.mean(axis=2)
+
+        # si la intensidad promedio es suficientemente oscura => "línea"
         detected = 1 if gray.mean() < threshold else 0
         states.append(detected)
+
     return states
 
+
 def set_motor_speeds(norm_left, norm_right):
-    """Set both wheel speeds using normalized values (-1 to 1)"""
-    norm_left = max(-1.0, min(1.0, norm_left))
-    norm_right = max(-1.0, min(1.0, norm_right))
-    
-    left_linear_velocity = norm_left * MAX_SPEED
-    right_linear_velocity = norm_right * MAX_SPEED
-    
-    left_angular_velocity = left_linear_velocity / (WHEEL_D / 2)
-    right_angular_velocity = right_linear_velocity / (WHEEL_D / 2)
-    
+    """
+    Aplica velocidades normalizadas [-1..1] a cada rueda.
+
+    - Aplica saturación.
+    - Convierte a velocidad lineal (m/s).
+    - Convierte a velocidad angular (rad/s) usando el radio de la llanta.
+    - Aplica la dirección física MOTOR_SIGN_LEFT / MOTOR_SIGN_RIGHT.
+    """
+    # limitar a [-1,1]
+    nl = max(-1.0, min(1.0, norm_left))
+    nr = max(-1.0, min(1.0, norm_right))
+
+    # aplicar signos físicos de montaje
+    nl *= MOTOR_SIGN_LEFT
+    nr *= MOTOR_SIGN_RIGHT
+
+    # convertir a velocidad lineal m/s
+    left_linear_velocity = nl * MAX_SPEED
+    right_linear_velocity = nr * MAX_SPEED
+
+    # convertir a velocidad angular [rad/s]
+    left_ang_vel = left_linear_velocity / (WHEEL_D / 2)
+    right_ang_vel = right_linear_velocity / (WHEEL_D / 2)
+
+    # mandar a los joints en CoppeliaSim
     client.setStepping(True)
-    sim.setJointTargetVelocity(left_mtr, left_angular_velocity)
-    sim.setJointTargetVelocity(right_mtr, right_angular_velocity)
+    sim.setJointTargetVelocity(left_mtr, left_ang_vel)
+    sim.setJointTargetVelocity(right_mtr, right_ang_vel)
     client.setStepping(False)
 
-def calculate_line_position(sensors):
+    # Regresamos los comandos ya con signo aplicado (para debug/telemetría)
+    return nl, nr
+
+
+# =========================================================
+# ============== LÓGICA DE CONTROL DEL SEGUIDOR ============
+# =========================================================
+
+def compute_line_error(sensor_states, last_error):
     """
-    Calculate the position of the line relative to the robot center.
-    Returns a value between -1 (far left) and 1 (far right), 0 = center
+    Convierte lecturas binarias de los sensores en un error continuo.
+
+    - Calcula la posición promedio de la línea usando WEIGHTS.
+    - Resta TARGET_OFFSET para que "estar donde queremos" sea error ~ 0.
+    - Si no vemos la línea (todos 0), devolvemos last_error para intentar
+      seguir girando hacia donde la vimos por última vez.
     """
-    weights = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
-    
-    weighted_sum = sum(sensor * weight for sensor, weight in zip(sensors, weights))
-    sensor_count = sum(sensors)
-    
-    if sensor_count == 0:
-        return None
-    
-    position = weighted_sum / sensor_count
-    return position / 3.5
+    s = np.array(sensor_states, dtype=float)
+    active_sum = s.sum()
 
-def detect_finish_line(sensors):
-    """Detect if we've reached the finish line (many sensors detecting black)"""
-    sensor_count = sum(sensors)
-    return sensor_count >= 6  # If 6 or more sensors detect black, it's likely the finish
+    if active_sum <= LOST_LINE_THRESHOLD:
+        # línea perdida: usa el último error como referencia
+        # esto hace que el robot gire hacia el último lado conocido
+        return last_error
 
-def smooth_speed_transition(current_speed, target_speed, max_change=0.05):
-    """Gradually change speed to avoid abrupt changes"""
-    if abs(target_speed - current_speed) <= max_change:
-        return target_speed
-    elif target_speed > current_speed:
-        return current_speed + max_change
-    else:
-        return current_speed - max_change
+    # promedio ponderado de la posición aparente de la línea
+    weighted_pos = float((WEIGHTS * s).sum() / active_sum)
 
-# --- Initialization code --- #
-WHEEL_D = 0.05
-MAX_SPEED = 1.2
+    # ajustar por el offset objetivo
+    error = weighted_pos - TARGET_OFFSET
+    return error
+
+
+class PIDController:
+    """
+    Control PID clásico con anti-windup simple.
+    Aquí en realidad vamos a usarlo más como PD (Ki puede quedarse en 0).
+    """
+
+    def __init__(self, Kp, Ki, Kd, integral_limit=1.0):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+
+        self.integral = 0.0
+        self.integral_limit = integral_limit  # recorte para evitar windup
+        self.prev_error = 0.0
+        self.prev_time = None
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+
+    def update(self, error):
+        now = time.time()
+
+        # calcular dt
+        if self.prev_time is None:
+            dt = 0.0
+        else:
+            dt = now - self.prev_time
+            if dt <= 0:
+                dt = 1e-6
+
+        # término proporcional
+        P = self.Kp * error
+
+        # término integral (con anti-windup)
+        self.integral += error * dt
+        # limitar integral
+        if self.integral > self.integral_limit:
+            self.integral = self.integral_limit
+        elif self.integral < -self.integral_limit:
+            self.integral = -self.integral_limit
+        I = self.Ki * self.integral
+
+        # término derivativo
+        d_error = (error - self.prev_error) / dt if dt > 0 else 0.0
+        D = self.Kd * d_error
+
+        # guardar estado
+        self.prev_error = error
+        self.prev_time = now
+
+        # salida total
+        return P + I + D
+
+
+def compute_motor_commands(pid_output):
+    """
+    Usa la salida del PID (pid_output) para hacer un giro diferencial.
+
+    - STEERING_SIGN controla el sentido de giro lógico
+      (si el robot gira para el lado equivocado, cámbialo a -1.0)
+    - MAX_CORRECTION limita la agresividad del giro.
+    - Se suma la corrección a una rueda y se resta a la otra.
+    """
+
+    correction = STEERING_SIGN * pid_output
+
+    # limitar giro para no saturar instantáneamente
+    correction = max(-MAX_CORRECTION, min(MAX_CORRECTION, correction))
+
+    # mezcla diferencial
+    left_cmd = BASE_SPEED - correction
+    right_cmd = BASE_SPEED + correction
+
+    # saturar por seguridad antes de mandar
+    left_cmd = max(-1.0, min(1.0, left_cmd))
+    right_cmd = max(-1.0, min(1.0, right_cmd))
+
+    return left_cmd, right_cmd
+
+
+# =========================================================
+# ================== INICIALIZACIÓN SIM ===================
+# =========================================================
+
 client = RemoteAPIClient('localhost', 23000)
 sim = client.getObject('sim')
+
 left_mtr = sim.getObject('/LineTracer/DynamicLeftJoint')
 right_mtr = sim.getObject('/LineTracer/DynamicRightJoint')
 cam_handles = [sim.getObject(f"/LineTracer/lineSensor[{i}]") for i in range(8)]
 
-# --- Improved Control parameters --- #
-BASE_SPEED = 0.4           # Reduced base speed for stability
-MIN_SPEED = 0.2            # Minimum speed for curves
-MAX_CURVE_SPEED = 0.3      # Maximum speed in curves
-STEERING_GAIN = 0.4        # Reduced steering gain for smoother control
-SEARCH_SPEED = 0.25        # Speed when searching for line
 
-# Enhanced PID Controller
-class SmoothPIDController:
-    def __init__(self, kp=0.5, ki=0.0, kd=0.15):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.previous_error = 0
-        self.integral = 0
-        self.last_time = time.time()
-        self.error_history = []
-        self.max_output = 1.0
-        
-    def update(self, error):
-        current_time = time.time()
-        dt = current_time - self.last_time
-        
-        if dt <= 0:
-            dt = 0.01
-        
-        # Smooth the error using moving average
-        self.error_history.append(error)
-        if len(self.error_history) > 3:  # Keep last 3 values
-            self.error_history.pop(0)
-        
-        smoothed_error = sum(self.error_history) / len(self.error_history)
-        
-        # PID calculation with smoothed error
-        proportional = self.kp * smoothed_error
-        
-        # Limit integral windup
-        self.integral += smoothed_error * dt
-        self.integral = max(-1.0, min(1.0, self.integral))
-        integral = self.ki * self.integral
-        
-        derivative = self.kd * (smoothed_error - self.previous_error) / dt
-        
-        output = proportional + integral + derivative
-        
-        # Limit output
-        output = max(-self.max_output, min(self.max_output, output))
-        
-        self.previous_error = smoothed_error
-        self.last_time = current_time
-        
-        return output
+# =========================================================
+# ======================= LOOP MAIN =======================
+# =========================================================
 
-# Line Recovery System
-class LineRecovery:
-    def __init__(self):
-        self.recovery_mode = False
-        self.recovery_direction = 0  # -1 for left, 1 for right
-        self.recovery_start_time = 0
-        self.max_recovery_time = 2.0  # Maximum time to try recovery
-        self.backup_distance = 0
-        
-    def start_recovery(self, last_position):
-        """Start recovery mode based on last known line position"""
-        self.recovery_mode = True
-        self.recovery_direction = 1 if last_position > 0 else -1
-        self.recovery_start_time = time.time()
-        self.backup_distance = 0
-        print(f"Starting recovery mode, direction: {'right' if self.recovery_direction > 0 else 'left'}")
-        
-    def get_recovery_speeds(self):
-        """Get motor speeds for recovery maneuver"""
-        elapsed_time = time.time() - self.recovery_start_time
-        
-        if elapsed_time < 0.5:
-            # First phase: backup slightly
-            return -SEARCH_SPEED * 0.5, -SEARCH_SPEED * 0.5
-        else:
-            # Second phase: turn to search for line
-            if self.recovery_direction > 0:  # Turn right
-                return SEARCH_SPEED * 0.8, -SEARCH_SPEED * 0.6
-            else:  # Turn left
-                return -SEARCH_SPEED * 0.6, SEARCH_SPEED * 0.8
-                
-    def should_stop_recovery(self):
-        """Check if recovery should stop (timeout)"""
-        return time.time() - self.recovery_start_time > self.max_recovery_time
-        
-    def reset(self):
-        """Reset recovery system"""
-        self.recovery_mode = False
-        print("Recovery mode ended")
-
-# Initialize systems
-pid = SmoothPIDController(kp=0.6, ki=0.0, kd=0.2)
-recovery = LineRecovery()
-
-# State variables
-last_line_position = 0
-line_lost_counter = 0
-MAX_LINE_LOST = 5  # Reduced for faster recovery
-current_left_speed = 0
-current_right_speed = 0
-consecutive_good_readings = 0
-
-# Main control loop
 if __name__ == "__main__":
+    controller = PIDController(Kp, Ki, Kd)
+    controller.reset()
+
+    last_error = 0.0  # para recuperación cuando perdemos la línea
+
     try:
         sim.startSimulation()
-        print("Simulation started. Robot should start following the line...")
-        
-        while sim.getSimulationState() != sim.simulation_stopped:
-            sensors = get_sensor_values()
-            print(f"Sensors: {sensors}")
-            
-            # Check for finish line
-            if detect_finish_line(sensors):
-                print("🏁 FINISH LINE DETECTED! Stopping robot.")
-                set_motor_speeds(0, 0)
-                time.sleep(1)
-                break
-            
-            # Calculate line position
-            line_position = calculate_line_position(sensors)
-            
-            if line_position is not None:
-                # Line detected - reset recovery and counters
-                if recovery.recovery_mode:
-                    recovery.reset()
-                line_lost_counter = 0
-                last_line_position = line_position
-                consecutive_good_readings += 1
-                
-                # Calculate steering with PID
-                steering_correction = pid.update(line_position)
-                
-                # Adaptive speed based on line position and stability
-                error_magnitude = abs(line_position)
-                if error_magnitude > 0.7:  # Sharp curve
-                    target_base_speed = MIN_SPEED
-                elif error_magnitude > 0.4:  # Medium curve
-                    target_base_speed = MAX_CURVE_SPEED
-                elif consecutive_good_readings > 10:  # Stable straight line
-                    target_base_speed = BASE_SPEED
-                else:  # Recently recovered
-                    target_base_speed = MAX_CURVE_SPEED
-                
-                # Calculate target speeds
-                target_left = target_base_speed - STEERING_GAIN * steering_correction
-                target_right = target_base_speed + STEERING_GAIN * steering_correction
-                
-                # Smooth speed transitions
-                left_speed = smooth_speed_transition(current_left_speed, target_left)
-                right_speed = smooth_speed_transition(current_right_speed, target_right)
-                
-                print(f"Line pos: {line_position:.2f}, Correction: {steering_correction:.2f}, Speed: L={left_speed:.2f} R={right_speed:.2f}")
-                
-            else:
-                # No line detected
-                consecutive_good_readings = 0
-                line_lost_counter += 1
-                print(f"Line lost! Counter: {line_lost_counter}")
-                
-                if line_lost_counter >= MAX_LINE_LOST and not recovery.recovery_mode:
-                    # Start recovery mode
-                    recovery.start_recovery(last_line_position)
-                
-                if recovery.recovery_mode:
-                    # Use recovery system
-                    left_speed, right_speed = recovery.get_recovery_speeds()
-                    
-                    if recovery.should_stop_recovery():
-                        # Recovery failed, do aggressive search
-                        left_speed = SEARCH_SPEED
-                        right_speed = -SEARCH_SPEED
-                        recovery.reset()
-                        print("Recovery timeout - aggressive search mode")
-                else:
-                    # Simple continuation in last direction
-                    if last_line_position > 0.1:  # Line was on the right
-                        left_speed = SEARCH_SPEED * 0.8
-                        right_speed = SEARCH_SPEED * 0.3
-                    elif last_line_position < -0.1:  # Line was on the left
-                        left_speed = SEARCH_SPEED * 0.3
-                        right_speed = SEARCH_SPEED * 0.8
-                    else:  # Go straight briefly
-                        left_speed = SEARCH_SPEED * 0.6
-                        right_speed = SEARCH_SPEED * 0.6
-                
-                print(f"Search mode: Left: {left_speed:.2f}, Right: {right_speed:.2f}")
-            
-            # Update current speeds and apply
-            current_left_speed = left_speed
-            current_right_speed = right_speed
-            set_motor_speeds(left_speed, right_speed)
-            
-            time.sleep(0.01)
+        print("Seguidor de línea corriendo. Presiona 'q' para salir.")
 
-    except KeyboardInterrupt:
-        print("Interrupted by user")
+        while sim.getSimulationState() != sim.simulation_stopped:
+
+            # Salida manual (si tienes la lib keybrd)
+            if is_pressed('q'):
+                break
+
+            # 1. leer sensores
+            sensors = get_sensor_values()
+            # debug:
+            # print("sensores:", sensors)
+
+            # 2. calcular error lateral
+            error = compute_line_error(sensors, last_error)
+            last_error = error
+            # print("error:", round(error,3))
+
+            # 3. PID / PD
+            pid_out = controller.update(error)
+            # print("pid_out:", round(pid_out,3))
+
+            # 4. convertir a velocidades de ruedas
+            left_cmd, right_cmd = compute_motor_commands(pid_out)
+
+            # 5. mandar a motores
+            nl, nr = set_motor_speeds(left_cmd, right_cmd)
+            # print(f"L:{nl:.2f} R:{nr:.2f}")
+
+            # 6. pausa pequeña para control estable
+            time.sleep(CONTROL_DT)
+
     finally:
-        print("Stopping simulation...")
+        # apagar robot con seguridad
+        set_motor_speeds(0.0, 0.0)
         sim.stopSimulation()
+        print("Simulación detenida.")
